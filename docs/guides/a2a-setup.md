@@ -151,3 +151,39 @@ curl -X POST http://localhost:8080/a2a/t-YOUR_TOKEN \
 ## Advanced Configuration
 
 For detailed A2A protocol specifications, API examples, and integration patterns, see the [Advanced Connectivity Guide](../developer/connectivity.md).
+
+
+## Continuing a conversation
+
+Messages sent without `contextId` start independent conversations. Save the returned task's
+`contextId` and include it in subsequent messages to continue the same Agent Zero history.
+Every turn receives a new task ID; a completed task is not reopened. A2A context IDs are
+opaque conversation handles, not native UI chat IDs or Langflow session IDs.
+
+For example, send `message/send` to the connection URL with:
+
+```json
+{"jsonrpc":"2.0","id":"turn-1","method":"message/send","params":{"message":{"kind":"message","messageId":"unique-message-1","role":"user","parts":[{"kind":"text","text":"Remember this test fact."}]}}}
+```
+
+Poll `tasks/get` using the returned task ID until it completes. Use the returned
+`contextId` for the follow-up:
+
+```json
+{"jsonrpc":"2.0","id":"turn-2","method":"message/send","params":{"message":{"kind":"message","messageId":"unique-message-2","contextId":"RETURNED_CONTEXT_ID","role":"user","parts":[{"kind":"text","text":"Recall the test fact."}]}}}
+```
+
+Use the same project connection URL for every turn. Unknown, expired or wrong-project
+handles return an error without starting replacement work. Turns in one conversation
+are serialized; different conversations may run independently. `tasks/cancel` affects
+only the selected task and leaves conversation history available.
+
+Conversation retention is process-local, with a 24-hour idle lifetime. Restarting or
+reconfiguring the A2A service invalidates its handles. There is no task crash recovery.
+A timeout at the client does not imply remote cancellation; check task status rather
+than blindly resubmitting the message.
+
+Both `/.well-known/agent-card.json` and the legacy `/.well-known/agent.json` are served.
+The modern card advertises A2A 0.3. FastA2A 0.6.1 is installed through the image
+requirements and the existing self-update dependency migration. No workflow upgrade
+or live deployment is performed merely by changing these source files.

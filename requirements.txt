@@ -5,7 +5,7 @@ duckduckgo-search==6.1.12
 pyreqwest-impersonate==0.5.3  # freeze nearest wheel-backed release; 0.5.5 is source-only
 faiss-cpu==1.11.0
 fastmcp==3.2.4
-fasta2a==0.5.0
+fasta2a==0.6.1
 flask[async]==3.0.3
 flask-basicauth==0.2.0
 flaredantic==0.1.5
