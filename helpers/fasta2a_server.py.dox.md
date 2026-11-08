@@ -2,56 +2,21 @@
 
 ## Purpose
 
-- Own the `fasta2a_server.py` helper module.
-- This module serves Agent Zero through a dynamic A2A proxy.
-- Keep this file-level DOX profile synchronized with `fasta2a_server.py` because this directory is intentionally flat.
+Serve Agent Zero through the authenticated dynamic A2A proxy. Reuse a conversation across tasks while keeping unrelated contexts separate.
 
-## Ownership
+## Contracts
 
-- `fasta2a_server.py` owns the runtime implementation.
-- `fasta2a_server.py.dox.md` owns durable notes about responsibilities, contracts, side effects, and verification for that implementation.
-- Classes:
-- `AgentZeroFastA2A` (`FastA2A`)
-  - `async _agent_card_endpoint(self, request: Request) -> StarletteResponse`
-- `AgentZeroWorker` (`Worker`)
-  - `async run_task(self, params: Any) -> None`
-  - `async cancel_task(self, params: Any) -> None`
-  - `build_message_history(self, history: List[Any]) -> List[Message]`
-  - `build_artifacts(self, result: Any) -> List[Artifact]`
-- `DynamicA2AProxy` (no explicit base class)
-  - `get_instance()`
-  - `reconfigure(self, token: str)`
-- Top-level functions:
-- `_enable_streaming_capability(agent_card_body: bytes) -> bytes`: Ensure the generated A2A agent card advertises streaming support.
-- `is_available()`: Check if FastA2A is available and properly configured.
-- `get_proxy()`: Get the FastA2A proxy instance.
-- Notable constants/configuration names: `_PRINTER`.
-
-## Runtime Contracts
-
-- Helper modules own reusable framework APIs and must preserve public callers unless all callers, tests, and docs are updated together.
-- Update this file whenever public functions, classes, persistence behavior, path/security assumptions, side effects, or cross-module contracts change.
-- Agent Zero wraps `FastA2A` with `AgentZeroFastA2A` so the generated agent card sets `capabilities.streaming` to `true` by default.
-- Observed side-effect areas: filesystem writes, filesystem deletion, settings/state persistence, secret handling, scheduler state.
-- Imported dependency areas include: `agent`, `asyncio`, `atexit`, `contextlib`, `helpers`, `helpers.persist_chat`, `helpers.print_style`, `initialize`, `json`, `starlette.requests`, `starlette.responses`, `threading`, `typing`, `uuid`.
-
-## Key Concepts
-
-- Important called helpers/classes observed in the source: `PrintStyle`, `DynamicA2AProxy.get_instance`, `json.loads`, `json.dumps`, `super.__init__`, `super._agent_card_endpoint`, `join`, `UserMessage`, `threading.Lock`, `atexit.register`, `self._configure`, `settings.get_settings`, `path.startswith`, `self._convert_message`, `initialize_agent`, `AgentContext`, `context.log.log`, `context.communicate`, `context.reset`, `AgentContext.remove`, `remove_chat`, `self.storage.update_task`, `self._register_shutdown`.
-- Keep request/response, tool, or helper semantics documented here at the same time as source changes.
-
-## Work Guidance
-
-- Preserve public helper APIs used by core code and plugins unless every caller is updated.
-- Keep path, auth, secret, persistence, network, and subprocess behavior explicit and bounded.
-- Prefer adding cohesive helper functions here only when behavior is reused across modules.
+- `AgentZeroStorage` extends FastA2A's process-local task/context store. Its conversation entries contain an Agent Zero context ID, project, execution lock, pending count and activity timestamp. It never aliases caller-supplied A2A IDs to existing user chats.
+- A message without `contextId` starts a fresh conversation. A supplied ID must exist and match the project's scope before a new task is accepted. Unavailable IDs produce JSON-RPC invalid-parameters errors; there is no silent fallback.
+- `AgentZeroWorker` reuses one BACKGROUND context per conversation and serializes its turns. Different conversations are independent. The first agent configuration/profile remains in effect. Failed/cancelled tasks do not delete the conversation.
+- Cancellation stops only the matching active task or skips matching queued work. Late worker results cannot overwrite terminal task states.
+- Conversations expire after 24 idle hours. The existing API-chat cleanup uses `lifetime_hours`; lazy pruning also removes stale mappings and resets expired contexts. Pending/active work is not pruned. Shutdown/reconfiguration clears retained contexts.
+- Conversations remain BACKGROUND and are not written to chat persistence. Process restart/reconfiguration invalidates conversation IDs; this does not provide crash recovery of in-flight computation.
+- Task timestamps are UTC RFC 3339. Completed replies are text artifacts and history messages. Reading a shortened history does not mutate stored history.
+- `AgentZeroFastA2A` serves both agent-card paths. Request-specific RPC URLs preserve the auth/project prefix and are not cached across projects. The existing streaming-capability wrapper remains unchanged.
+- `DynamicA2AProxy` retains the existing token/header authorization. Project injection buffers a complete ASGI request before returning rewritten bytes, including chunked bodies. Never log token-bearing URLs.
+- The transport does not alter provider settings or agent source code; retained conversations are BACKGROUND runtime state.
 
 ## Verification
 
-- Run targeted tests for changed helper behavior; run security regressions for auth, filesystem, WebSocket, tunnel, upload, or secret-handling helpers.
-- Related tests:
-  - `tests/test_fasta2a_server.py`
-
-## Child DOX Index
-
-No child DOX files.
+Run `python -m pytest tests/test_fasta2a_server.py tests/test_a2a_conversations.py tests/test_framework_dependencies.py -q` in the framework environment with development requirements. Tests use fake agents, real FastA2A and the official SDK over an in-process HTTP transport; no keys, external services or local user state are required.

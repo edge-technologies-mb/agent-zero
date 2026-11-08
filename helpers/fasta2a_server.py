@@ -6,6 +6,9 @@ import json
 from typing import Any, List
 import contextlib
 import threading
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from helpers import settings, projects
 from starlette.responses import Response as StarletteResponse
@@ -15,7 +18,6 @@ from starlette.requests import Request
 from helpers.print_style import PrintStyle
 from agent import AgentContext, UserMessage, AgentContextType
 from initialize import initialize_agent
-from helpers.persist_chat import remove_chat
 
 # Import FastA2A
 try:
@@ -74,109 +76,187 @@ def _enable_streaming_capability(agent_card_body: bytes) -> bytes:
     return json.dumps(agent_card, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-class AgentZeroFastA2A(FastA2A):  # type: ignore[misc]
-    """FastA2A app with Agent Zero defaults layered over library defaults."""
+class ConversationUnavailable(ValueError):
+    """A caller supplied a context that cannot be resumed in this scope."""
+
+
+@dataclass
+class _Conversation:
+    project: str | None
+    agent_context_id: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_used: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    pending: int = 0
+    active_task_id: str | None = None
+
+
+class AgentZeroStorage(InMemoryStorage):
+    """Process-local conversations and RFC 3339 task timestamps."""
+
+    def _prune(self):
+        now = datetime.now(timezone.utc)
+        for context_id, entry in list(self.contexts.items()):
+            if entry.pending:
+                continue
+            context = AgentContext.get(entry.agent_context_id) if entry.agent_context_id else None
+            if (entry.agent_context_id and context is None) or now - entry.last_used >= timedelta(hours=24):
+                if context:
+                    context.reset()
+                    AgentContext.remove(context.id)
+                del self.contexts[context_id]
+
+    async def submit_task(self, context_id, message):
+        self._prune()
+        project = (message.get('metadata') or {}).get('project') or None
+        entry = await self.load_context(context_id)
+        unavailable = entry is None or entry.project != project
+        if entry and entry.agent_context_id and AgentContext.get(entry.agent_context_id) is None:
+            unavailable = True
+        if 'context_id' in message and unavailable:
+            raise ConversationUnavailable('Conversation unavailable for this project')
+        if entry is None:
+            entry = _Conversation(project=project)
+            await self.update_context(context_id, entry)
+        task = await super().submit_task(context_id, message)
+        task['status']['timestamp'] = datetime.now(timezone.utc).isoformat()
+        entry.pending += 1
+        return task
+
+    async def update_task(self, task_id, state, new_artifacts=None, new_messages=None):
+        # A cancelled task's eventual worker result must not resurrect it.
+        current = self.tasks[task_id]
+        if current['status']['state'] in ('completed', 'failed', 'canceled', 'rejected'):
+            return current
+        task = await super().update_task(task_id, state, new_artifacts, new_messages)
+        task['status']['timestamp'] = datetime.now(timezone.utc).isoformat()
+        return task
+
+    async def load_task(self, task_id, history_length=None):
+        # FastA2A 0.6.1 otherwise trims the canonical history during polling.
+        task = self.tasks.get(task_id)
+        if task is None:
+            return None
+        result = deepcopy(task)
+        if history_length is not None:
+            result['history'] = result.get('history', [])[-history_length:] if history_length else []
+        return result
+
+    def close_contexts(self):
+        for entry in self.contexts.values():
+            if entry.agent_context_id:
+                context = AgentContext.get(entry.agent_context_id)
+                if context:
+                    context.reset()
+                    AgentContext.remove(context.id)
+        self.contexts.clear()
+
+
+class AgentZeroFastA2A(FastA2A):
+    """FastA2A with Agent Zero's routing and conversation errors."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if FASTA2A_AVAILABLE:
+            self.router.add_route('/.well-known/agent.json', self._agent_card_endpoint, methods=['HEAD', 'GET', 'OPTIONS'])
+
+    async def _agent_run_endpoint(self, request: Request) -> StarletteResponse:
+        try:
+            return await super()._agent_run_endpoint(request)
+        except ConversationUnavailable:
+            data = await request.json()
+            return StarletteResponse(content=json.dumps({
+                'jsonrpc': '2.0', 'id': data.get('id'),
+                'error': {'code': -32602, 'message': 'Conversation unavailable for this project'},
+            }), media_type='application/json')
 
     async def _agent_card_endpoint(self, request: Request) -> StarletteResponse:
         response = await super()._agent_card_endpoint(request)
-        body = _enable_streaming_capability(response.body)
-        self._agent_card_json_schema = body
-        return StarletteResponse(content=body, media_type="application/json")
+        body = json.loads(_enable_streaming_capability(response.body))
+        # Render request-specific routing without poisoning the cached base card.
+        body['url'] = request.scope.get('a0_a2a_base_url', str(request.base_url))
+        return StarletteResponse(content=json.dumps(body), media_type='application/json')
 
 
-class AgentZeroWorker(Worker):  # type: ignore[misc]
-    """Agent Zero implementation of FastA2A Worker."""
+class AgentZeroWorker(Worker):
+    """Execute separate A2A tasks against a retained, serialized conversation."""
 
     def __init__(self, broker, storage):
         super().__init__(broker=broker, storage=storage)
         self.storage = storage
 
-    async def run_task(self, params: Any) -> None:  # params: TaskSendParams
-        """Execute a task by processing the message through Agent Zero."""
-        context = None
-        try:
-            task_id = params['id']
-            message = params['message']
-
-            _PRINTER.print(f"[A2A] Processing task {task_id} with new temporary context")
-
-            # Convert A2A message to Agent Zero format
-            agent_message = self._convert_message(message)
-
-            # Always create new temporary context for this A2A conversation
-            cfg = initialize_agent()
-            context = AgentContext(cfg, type=AgentContextType.BACKGROUND)
-
-            # Retrieve project from message.metadata (standard A2A pattern)
-            metadata = message.get('metadata', {}) or {}
-            project_name = metadata.get('project')
-         
-            # Activate project if specified
-            if project_name:
-                projects.activate_project(context.id, project_name)
-
-            # Log user message so it appears instantly in UI chat window
-            context.log.log(
-                type="user",  # type: ignore[arg-type]
-                heading="Remote user message",
-                content=agent_message.message,
-                kvps={"from": "A2A"},
-            )
-
-            # Process message through Agent Zero (includes response)
-            task = context.communicate(agent_message)
-            result_text = await task.result()
-
-            # Build A2A message from result
-            response_message: Message = {  # type: ignore
-                'role': 'agent',
-                'parts': [{'kind': 'text', 'text': str(result_text)}],
-                'kind': 'message',
-                'message_id': str(uuid.uuid4())
-            }
-
-            await self.storage.update_task(  # type: ignore[attr-defined]
-                task_id=task_id,
-                state='completed',
-                new_messages=[response_message]
-            )
-
-            # Clean up context like non-persistent MCP chats
-            context.reset()
-            AgentContext.remove(context.id)
-            remove_chat(context.id)
-
-            _PRINTER.print(f"[A2A] Completed task {task_id} and cleaned up context")
-
-        except Exception as e:
-            _PRINTER.print(f"[A2A] Error processing task {params.get('id', 'unknown')}: {e}")
-            await self.storage.update_task(
-                task_id=params.get('id', 'unknown'),
-                state='failed'
-            )
-
-            # Clean up context even on failure to prevent resource leaks
-            if context:
-                context.reset()
-                AgentContext.remove(context.id)
-                remove_chat(context.id)
-                _PRINTER.print(f"[A2A] Cleaned up failed context {context.id}")
-
-    async def cancel_task(self, params: Any) -> None:  # params: TaskIdParams
-        """Cancel a running task."""
+    async def run_task(self, params: Any) -> None:
         task_id = params['id']
-        _PRINTER.print(f"[A2A] Cancelling task {task_id}")
-        await self.storage.update_task(task_id=task_id, state='canceled')  # type: ignore[attr-defined]
+        entry = await self.storage.load_context(params['context_id'])
+        if entry is None:
+            await self.storage.update_task(task_id, state='failed')
+            return
+        try:
+            async with entry.lock:
+                task = await self.storage.load_task(task_id)
+                if task['status']['state'] == 'canceled':
+                    return
+                context = AgentContext.get(entry.agent_context_id) if entry.agent_context_id else None
+                if entry.agent_context_id and context is None:
+                    raise ConversationUnavailable('Conversation expired while queued')
+                if context is None:
+                    context = AgentContext(initialize_agent(), type=AgentContextType.BACKGROUND)
+                    try:
+                        context.set_data('lifetime_hours', 24)
+                        if entry.project:
+                            projects.activate_project(context.id, entry.project)
+                    except Exception:
+                        context.reset()
+                        AgentContext.remove(context.id)
+                        raise
+                    entry.agent_context_id = context.id
+                entry.active_task_id = task_id
+                await self.storage.update_task(task_id, state='working')
+                message = self._convert_message(params['message'])
+                context.log.log(type='user', heading='Remote user message', content=message.message, kvps={'from': 'A2A'})
+                result = await context.communicate(message).result()
+                await self.storage.update_task(
+                    task_id, state='completed',
+                    new_messages=[{'role': 'agent', 'kind': 'message', 'message_id': str(uuid.uuid4()),
+                                   'parts': [{'kind': 'text', 'text': str(result)}]}],
+                    new_artifacts=self.build_artifacts(result),
+                )
+        except asyncio.CancelledError:
+            if entry.active_task_id == task_id and entry.agent_context_id:
+                context = AgentContext.get(entry.agent_context_id)
+                if context:
+                    context.kill_process()
+            await self.storage.update_task(task_id, state='canceled')
+            raise
+        except Exception as exc:
+            _PRINTER.print(f'[A2A] Task failed ({type(exc).__name__})')
+            await self.storage.update_task(task_id, state='failed')
+        finally:
+            if entry.active_task_id == task_id:
+                entry.active_task_id = None
+            entry.pending -= 1
+            entry.last_used = datetime.now(timezone.utc)
+            if entry.agent_context_id:
+                context = AgentContext.get(entry.agent_context_id)
+                if context:
+                    context.last_message = entry.last_used
 
-        # Note: No context cleanup needed since contexts are always temporary and cleaned up in run_task
+    async def cancel_task(self, params: Any) -> None:
+        task = await self.storage.load_task(params['id'])
+        if task is None or task['status']['state'] in ('completed', 'failed', 'canceled', 'rejected'):
+            return
+        await self.storage.update_task(task['id'], state='canceled')
+        entry = await self.storage.load_context(task['context_id'])
+        if entry and entry.active_task_id == task['id'] and entry.agent_context_id:
+            context = AgentContext.get(entry.agent_context_id)
+            if context:
+                context.kill_process()
 
     def build_message_history(self, history: List[Any]) -> List[Message]:  # type: ignore
         # Not used in this simplified implementation
         return []
 
     def build_artifacts(self, result: Any) -> List[Artifact]:  # type: ignore
-        # No artifacts for now
-        return []
+        return [{'artifact_id': str(uuid.uuid4()), 'parts': [{'kind': 'text', 'text': str(result)}]}]
 
     def _convert_message(self, a2a_message: Message) -> UserMessage:  # type: ignore
         """Convert A2A message to Agent Zero UserMessage."""
@@ -239,7 +319,7 @@ class DynamicA2AProxy:
     def _configure(self):
         """Configure the FastA2A application with Agent Zero integration."""
         try:
-            storage = InMemoryStorage()  # type: ignore[arg-type]
+            storage = AgentZeroStorage()  # type: ignore[arg-type]
             broker = InMemoryBroker()  # type: ignore[arg-type]
 
             # Define Agent Zero's skills
@@ -325,6 +405,9 @@ class DynamicA2AProxy:
                 await self.app.task_manager.__aexit__(None, None, None)  # type: ignore[attr-defined]
         except Exception:
             pass
+
+        if hasattr(self, '_storage'):
+            self._storage.close_contexts()
 
     async def _async_reconfigure(self):
         """Perform async reconfiguration with proper lifecycle management."""
@@ -447,6 +530,12 @@ class DynamicA2AProxy:
                 })
                 return
 
+        # Preserve the externally visible route before stripping authentication/project prefixes.
+        original_path = scope.get('path', '')
+        base_path = original_path.split('/.well-known/', 1)[0].rstrip('/') + '/'
+        from starlette.datastructures import URL
+        external_url = str(URL(scope=scope).replace(path=base_path, query=''))
+
         # Handle token-based routing: /a2a/t-{token}/... or /t-{token}/...
         path = scope.get('path', '')
 
@@ -502,48 +591,37 @@ class DynamicA2AProxy:
 
                 async def receive_wrapper():
                     nonlocal body_modified
-
-                    # Receive and buffer the next message
-                    message = await original_receive()
-                    received_messages.append(message)
-
-                    # When we get the complete body, inject project into JSON
-                    if message['type'] == 'http.request' and not message.get('more_body', False) and not body_modified:
-                        body_modified = True
-                        try:
-                            import json
-                            # Reconstruct full body from all buffered messages
-                            body_parts = [msg.get('body', b'') for msg in received_messages if msg['type'] == 'http.request']
-                            full_body = b''.join(body_parts)
-                            data = json.loads(full_body)
-
-                            # INJECT project into message.metadata (standard A2A pattern)
-                            if 'params' in data and 'message' in data['params']:
-                                msg_data = data['params']['message']
-                                # Initialize metadata if it doesn't exist
-                                if 'metadata' not in msg_data or msg_data['metadata'] is None:
-                                    msg_data['metadata'] = {}
-                                msg_data['metadata']['project'] = project_name
-
-                            # Serialize back to JSON
-                            modified_body = json.dumps(data).encode('utf-8')
-
-                            # Return modified message IMMEDIATELY (before FastA2A processes it)
-                            return {
-                                'type': 'http.request',
-                                'body': modified_body,
-                                'more_body': False
-                            }
-                        except Exception as e:
-                            _PRINTER.print(f"[A2A] Failed to inject project into payload: {e}")
-
-                    return message
+                    if body_modified:
+                        return await original_receive()
+                    # ASGI may split a request into several chunks. Do not emit the
+                    # original prefix before emitting the rewritten complete body.
+                    while True:
+                        message = await original_receive()
+                        if message['type'] != 'http.request':
+                            return message
+                        received_messages.append(message)
+                        if not message.get('more_body', False):
+                            break
+                    body_modified = True
+                    full_body = b''.join(msg.get('body', b'') for msg in received_messages)
+                    try:
+                        data = json.loads(full_body)
+                        if 'params' in data and 'message' in data['params']:
+                            msg_data = data['params']['message']
+                            if not isinstance(msg_data.get('metadata'), dict):
+                                msg_data['metadata'] = {}
+                            msg_data['metadata']['project'] = project_name
+                        full_body = json.dumps(data).encode('utf-8')
+                    except (ValueError, TypeError):
+                        pass  # Let the protocol parser reject invalid input.
+                    return {'type': 'http.request', 'body': full_body, 'more_body': False}
 
                 receive = receive_wrapper
 
             # Update scope with cleaned path
             scope = dict(scope)
             scope['path'] = remaining_path
+            scope['a0_a2a_base_url'] = external_url
         else:
             # No token in path, check other auth methods
             request = Request(scope, receive=receive)
@@ -575,6 +653,10 @@ class DynamicA2AProxy:
             else:
                 _PRINTER.print("[A2A] No expected token found in settings")
 
+        scope = dict(scope)
+        scope.setdefault('a0_a2a_base_url', external_url)
+        if not path.startswith('/t-'):
+            scope['path'] = path or '/'
         # Delegate to FastA2A app with cleaned scope
         with self._lock:
             app = self.app
