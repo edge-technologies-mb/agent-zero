@@ -27,6 +27,7 @@ REQUIRED_RUNTIME_MARKERS = (
     "compresslevel=1,",
     "strict_timestamps=False,",
     "def get_top_stash_oid(",
+    "def validate_update_repository(",
     "def should_include_usr_backup_entry(",
     "Skipping non-regular usr backup entry",
     "def clean_transient_desktop_agent_state(",

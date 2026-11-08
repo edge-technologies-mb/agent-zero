@@ -25,7 +25,7 @@ Agent Zero includes a Docker-oriented self-update flow for switching to a specif
 3. The durable updater in `/exe` reads the YAML request before starting the UI.
 4. It cleans the root `uv` cache when `uv` is available.
 5. If requested, it creates a zip backup of `/a0/usr`.
-6. It fetches the requested branch and update target from the official Agent Zero repository.
+6. It fetches the requested branch and update target from the configured update repository (official Agent Zero by default).
 7. It updates `/a0` while preserving gitignored paths such as `/a0/usr`.
 8. It starts Agent Zero again and waits for `/api/health` to become healthy.
 9. If the UI does not become healthy within the allowed time, it restores the previous checkout and starts that version again.
@@ -53,7 +53,7 @@ Only versions from the current major release line are listed in the selector. If
 
 The selector also includes `latest` when the selected branch is still on the current major line:
 
-- On `main`, `latest` resolves to the newest reachable release tag on `main`. It is displayed as `latest (vX.Y)`.
+- On official `main`, `latest` resolves to the newest reachable release tag on `main`. It is displayed as `latest (vX.Y)`.
 - On `testing` and `development`, `latest` resolves to the current branch head. It is displayed as `latest (vX.Y+N)` when the branch head is `N` commits past the newest reachable tag, or `latest (vX.Y)` when it is exactly on a tag.
 
 Agent Zero version tags follow this format:
@@ -66,6 +66,50 @@ Examples:
 - `v1.1`
 
 Tags below `v1.0` are ignored by the selector and rejected by the self-update request validator.
+
+## Updating from a fork
+
+The server-side `A0_SELF_UPDATE_REMOTE_URL` environment variable selects the repository
+for both update discovery and execution. It defaults to
+`https://github.com/agent0ai/agent-zero.git`. To use a public fork, set it in the
+container configuration for a future deployment, for example:
+
+```text
+A0_SELF_UPDATE_REMOTE_URL=https://github.com/your-org/agent-zero.git
+```
+
+Use a credential-free HTTPS Git URL. Naming a local Git remote (for example
+`edge-tech`) does not configure the deployed updater. The UI displays the configured
+repository; it cannot change this server-side setting.
+
+For a custom repository, use **Advanced → main → latest**. `latest` follows the
+selected branch head, including patch commits after an inherited release tag.
+The label includes the number of commits after that tag. Quick updates are disabled
+for custom repositories. Advanced initially selects `main / latest` when supported.
+Choosing an explicit version tag instead installs that tag, which may precede your
+fork's patches.
+
+Fork discovery uses reachable Git tags rather than GitHub release objects, so a
+fork does not need its own GitHub Releases. Keep upstream `vX.Y` tags and history
+when maintaining the fork; they identify the major release line for compatibility
+checks. Merge or rebase upstream changes into the fork, run tests, and publish the
+reviewed branch before requesting an update. Updates do not merge upstream for you.
+The same-major restriction still applies to fork branch heads.
+
+A failed fork lookup never falls back to `origin` or the official repository.
+Discovery caches are repository-scoped. Queued requests store the validated URL;
+if the configured repository changes before execution, the updater records failure
+and leaves the checkout unchanged. Refresh and schedule again after correcting the
+configuration. Legacy requests without a URL remain valid only for the official
+repository. CLI-queued requests also record the configured URL.
+
+Existing images need the fork-aware application and durable updater before they
+can use this feature. On application startup, the existing runtime-sync migration
+validates and backs up the old `/exe/self_update_manager.py`, then replaces it from
+the repository copy if repository-binding support is missing. Until that capability
+is available, scheduling fork updates is blocked. Deploying the patched version
+initially is a separate step; changing this source does not configure or update an
+existing server.
 
 ## Major version limitation
 

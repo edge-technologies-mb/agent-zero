@@ -9,7 +9,9 @@ class SelfUpdateTags(ApiHandler):
         branch = str(input.get("branch", "")).strip().lower()
         current_branch = self_update.get_repo_version_info().get("branch", "").strip().lower()
         available_branch_values = self_update.get_available_branch_values()
-        if current_branch in available_branch_values:
+        if self_update.is_custom_repository() and "main" in available_branch_values:
+            default_branch = "main"
+        elif current_branch in available_branch_values:
             default_branch = current_branch
         elif "main" in available_branch_values:
             default_branch = "main"

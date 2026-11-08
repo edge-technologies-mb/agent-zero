@@ -15,6 +15,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ import yaml
 OFFICIAL_REPO_URL = os.environ.get(
     "A0_SELF_UPDATE_REMOTE_URL",
     "https://github.com/agent0ai/agent-zero.git",
-)
+).strip().rstrip("/")
 REPO_DIR = Path("/a0")
 TRIGGER_FILE = Path("/exe/a0-self-update.yaml")
 STATUS_FILE = Path("/exe/a0-self-update-status.yaml")
@@ -773,7 +774,7 @@ def fetch_release_refs(repo_dir: Path, branch: str, tag: str, logger: AttemptLog
         ],
         cwd=None,
         logger=logger,
-        error_message=f"Failed to fetch branch {branch} and tag {tag} from the official repository.",
+        error_message=f"Failed to fetch branch {branch} and tag {tag} from the configured repository.",
     )
     run_command(
         [
@@ -787,7 +788,7 @@ def fetch_release_refs(repo_dir: Path, branch: str, tag: str, logger: AttemptLog
         ],
         cwd=None,
         logger=logger,
-        error_message=f"Requested tag {tag} is not reachable from official branch {branch}.",
+        error_message=f"Requested tag {tag} is not reachable from configured branch {branch}.",
     )
 
 
@@ -807,9 +808,32 @@ def fetch_branch_refs(repo_dir: Path, branch: str, logger: AttemptLogger) -> str
         ],
         cwd=None,
         logger=logger,
-        error_message=f"Failed to fetch branch {branch} from the official repository.",
+        error_message=f"Failed to fetch branch {branch} from the configured repository.",
     )
     return remote_branch_ref
+
+
+def is_custom_update_source() -> bool:
+    return OFFICIAL_REPO_URL.rstrip("/").removesuffix(".git").lower() != "https://github.com/agent0ai/agent-zero"
+
+
+def validate_update_repository(request_data: dict[str, Any]) -> None:
+    parsed = urlsplit(OFFICIAL_REPO_URL)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Self-update repository must be an HTTPS URL without credentials, query or fragment."
+        )
+    expected = OFFICIAL_REPO_URL.rstrip("/").removesuffix(".git")
+    requested = str(request_data.get("remote_url", "")).rstrip("/").removesuffix(".git")
+    if (requested and requested != expected) or (is_custom_update_source() and not requested):
+        raise ValueError("Update repository changed or was not validated. Refresh and schedule the update again.")
 
 
 def resolve_requested_target(
@@ -834,7 +858,7 @@ def resolve_requested_target(
         }
 
     remote_branch_ref = fetch_branch_refs(repo_dir, branch, logger)
-    if branch == "main":
+    if branch == "main" and not is_custom_update_source():
         effective_tag = get_latest_same_major_tag(
             repo_dir,
             branch_ref=remote_branch_ref,
@@ -1082,6 +1106,7 @@ def record_result(
         "message": message,
         "branch": str(request_data.get("branch", "")),
         "tag": str(request_data.get("tag", "")),
+        "remote_url": OFFICIAL_REPO_URL,
         "source_version": source_info["short_tag"],
         "source_commit": source_info["commit"],
         "current_version": current_version,
@@ -1115,6 +1140,7 @@ def execute_pending_update(
     resolved_target: dict[str, str] | None = None
 
     try:
+        validate_update_repository(request_data)
         if not branch:
             raise ValueError("Update file is missing the branch field.")
         if not tag:
@@ -1318,6 +1344,7 @@ def queue_update_request(
     backup_name: str = "",
     backup_conflict_policy: str = DEFAULT_BACKUP_CONFLICT_POLICY,
 ) -> dict[str, Any]:
+    validate_update_repository({"remote_url": OFFICIAL_REPO_URL})
     source_info = get_repo_version_info(REPO_DIR)
     normalized_branch = (branch or "").strip().lower() or "main"
     normalized_tag = normalize_requested_tag(tag)
@@ -1331,6 +1358,7 @@ def queue_update_request(
     payload = {
         "branch": normalized_branch,
         "tag": normalized_tag,
+        "remote_url": OFFICIAL_REPO_URL,
         "source_version": source_info["short_tag"],
         "source_describe": source_info["describe"],
         "source_commit": source_info["commit"],
@@ -1350,6 +1378,8 @@ def installed_target_matches_request(
     requested_branch: str,
     requested_tag: str,
 ) -> bool:
+    if is_custom_update_source():
+        return False  # The same tag name can identify different commits in different forks.
     normalized_tag = requested_tag.strip()
     if not normalized_tag or is_latest_selector_tag(normalized_tag):
         return False
@@ -1370,7 +1400,7 @@ def trigger_update_command(args: list[str]) -> int:
         "branch",
         nargs="?",
         default="main",
-        help="Target official branch. Default: main",
+        help="Target branch in the configured repository. Default: main",
     )
     parser.add_argument(
         "tag",
@@ -1448,10 +1478,13 @@ def docker_run_ui() -> int:
             current = get_repo_version_info(REPO_DIR)
             requested_branch = str(request_data.get("branch", "")).strip()
             requested_tag = str(request_data.get("tag", "")).strip()
-            if installed_target_matches_request(
-                current,
-                requested_branch=requested_branch,
-                requested_tag=requested_tag,
+            if (
+                request_data.get("remote_url", OFFICIAL_REPO_URL) == OFFICIAL_REPO_URL
+                and installed_target_matches_request(
+                    current,
+                    requested_branch=requested_branch,
+                    requested_tag=requested_tag,
+                )
             ):
                 logger.log(
                     "Requested tag already matches the installed version, skipping file replacement."

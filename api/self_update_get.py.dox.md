@@ -24,6 +24,8 @@
 - `SelfUpdateGet` defines `get_methods(...)`.
 - Imported dependency areas include: `helpers`, `helpers.api`.
 
+- Successful update info includes `repository.url` (validated credential-free HTTPS) and `repository.is_custom`, plus fork-aware branch/tag defaults. Browser callers cannot supply or change the update repository.
+
 ## Key Concepts
 
 - Important called helpers/classes observed in the source: `self_update.get_update_info`, `runtime.is_dockerized`, `self_update.load_pending_update`, `self_update.load_last_status`.
