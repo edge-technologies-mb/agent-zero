@@ -26,6 +26,10 @@ DEFAULT_HEALTH_TIMEOUT_SECONDS = int(
 )
 
 
+def validate_update_repository(request_data):
+    return None
+
+
 def get_top_stash_oid(repo_dir):
     return ""
 
@@ -208,3 +212,19 @@ def test_self_update_runtime_sync_skips_non_regular_target(tmp_path):
     assert "not a regular file" in result["reason"]
     assert stat.S_ISLNK(target.lstat().st_mode)
     assert link_target.read_text(encoding="utf-8") == "# linked updater\n"
+
+
+def test_self_update_runtime_sync_upgrades_manager_without_repository_binding(tmp_path):
+    source = tmp_path / "source_self_update_manager.py"
+    target = tmp_path / "self_update_manager.py"
+    source.write_text(SAFE_SOURCE, encoding="utf-8")
+    old_source = SAFE_SOURCE.replace("def validate_update_repository(", "def old_repository_check(")
+    target.write_text(old_source, encoding="utf-8")
+
+    result = migration.ensure_self_update_manager_runtime_current(
+        source_path=source, target_path=target,
+    )
+
+    assert result["updated"] is True
+    assert target.read_text(encoding="utf-8") == SAFE_SOURCE
+    assert target.with_name(target.name + migration.BACKUP_SUFFIX).read_text(encoding="utf-8") == old_source

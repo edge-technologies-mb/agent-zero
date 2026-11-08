@@ -22,6 +22,8 @@
 - `SelfUpdateTags` defines `process(...)`.
 - Imported dependency areas include: `helpers`, `helpers.api`.
 
+- Branch defaults prefer `main` for a configured custom update repository; an explicitly requested branch is preserved. Tag discovery and branch-head `latest` semantics follow `helpers.self_update` and `A0_SELF_UPDATE_REMOTE_URL`. Authentication and CSRF behavior are unchanged.
+
 ## Key Concepts
 
 - Important called helpers/classes observed in the source: `str.strip.lower`, `self_update.get_repo_version_info.get.strip.lower`, `self_update.get_available_branch_values`, `self_update.get_selector_tag_options`, `str.strip`, `self_update.get_repo_version_info.get.strip`, `runtime.is_dockerized`, `self_update.get_repo_version_info`.

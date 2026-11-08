@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
+from urllib.parse import urlsplit
 
 from helpers import git, yaml
 from helpers.localization import Localization
@@ -32,14 +33,16 @@ STATUS_FILE_PATH = Path("/exe/a0-self-update-status.yaml")
 LOG_FILE_PATH = Path("/exe/a0-self-update.log")
 DURABLE_EXE_DIR = UPDATE_FILE_PATH.parent
 
-_remote_branch_tag_cache: dict[str, tuple[float, set[str]]] = {}
-_remote_branch_head_cache: dict[str, tuple[float, dict[str, str]]] = {}
+_remote_branch_tag_cache: dict[tuple[str, str], tuple[float, set[str]]] = {}
+_remote_branch_head_cache: dict[tuple[str, str], tuple[float, dict[str, str]]] = {}
 _remote_branch_list_cache: tuple[float, list[str]] | None = None
+_remote_branch_list_cache_source: str | None = None
 
 
 class PendingUpdateConfig(TypedDict):
     branch: str
     tag: str
+    remote_url: str
     source_version: str
     source_describe: str
     source_commit: str
@@ -51,6 +54,7 @@ class PendingUpdateConfig(TypedDict):
 
 
 class UpdateStatus(TypedDict, total=False):
+    remote_url: str
     status: str
     message: str
     branch: str
@@ -142,8 +146,35 @@ def get_repo_self_update_manager_path(
     return get_repo_dir(repo_dir) / "docker" / "run" / "fs" / "exe" / "self_update_manager.py"
 
 
-def _get_official_remote_url() -> str:
-    return f"https://github.com/{OFFICIAL_REPO_AUTHOR}/{OFFICIAL_REPO_NAME}.git"
+def _get_update_remote_url() -> str:
+    default = f"https://github.com/{OFFICIAL_REPO_AUTHOR}/{OFFICIAL_REPO_NAME}.git"
+    url = os.environ.get("A0_SELF_UPDATE_REMOTE_URL", default).strip().rstrip("/")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Self-update repository must be an HTTPS URL without credentials, query or fragment."
+        )
+    return url
+
+
+def is_custom_repository() -> bool:
+    return _get_update_remote_url().removesuffix(".git").lower() != "https://github.com/agent0ai/agent-zero"
+
+
+def durable_self_update_supports_repository(
+    repo_dir: str | Path | None = None,
+) -> bool:
+    for path in [get_durable_self_update_manager_path(), get_repo_self_update_manager_path(repo_dir)]:
+        if path.exists():
+            return "def validate_update_repository(" in path.read_text(encoding="utf-8")
+    return False
 
 
 def _run_git_raw(*args: str) -> str:
@@ -287,16 +318,19 @@ def _sort_branch_names(branches: list[str]) -> list[str]:
 
 
 def _get_remote_branch_names() -> list[str]:
-    global _remote_branch_list_cache
+    global _remote_branch_list_cache, _remote_branch_list_cache_source
+
+    source = _get_update_remote_url()
 
     now = time.monotonic()
     if (
         _remote_branch_list_cache
+        and _remote_branch_list_cache_source == source
         and now - _remote_branch_list_cache[0] <= REMOTE_BRANCH_LIST_CACHE_TTL_SECONDS
     ):
         return list(_remote_branch_list_cache[1])
 
-    output = _run_git_raw("ls-remote", "--heads", _get_official_remote_url())
+    output = _run_git_raw("ls-remote", "--heads", _get_update_remote_url())
     branches: list[str] = []
     prefix = "refs/heads/"
     for line in output.splitlines():
@@ -310,6 +344,7 @@ def _get_remote_branch_names() -> list[str]:
 
     sorted_branches = _sort_branch_names(branches)
     _remote_branch_list_cache = (now, sorted_branches)
+    _remote_branch_list_cache_source = source
     return list(sorted_branches)
 
 
@@ -347,6 +382,8 @@ def get_available_branch_values(
     except Exception:
         pass
 
+    if is_custom_repository():
+        raise RuntimeError("Cannot discover branches from the configured update repository.")
     local_origin_branches = _get_local_origin_branch_names(repo_dir=repo_dir)
     if local_origin_branches:
         return local_origin_branches
@@ -396,7 +433,8 @@ def _get_remote_branch_merged_tags(branch: str) -> set[str]:
     if _is_excluded_self_update_branch(normalized_branch):
         return set()
 
-    cached = _remote_branch_tag_cache.get(normalized_branch)
+    cache_key = (_get_update_remote_url(), normalized_branch)
+    cached = _remote_branch_tag_cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached[0] <= REMOTE_BRANCH_TAG_CACHE_TTL_SECONDS:
         return set(cached[1])
@@ -411,13 +449,13 @@ def _get_remote_branch_merged_tags(branch: str) -> set[str]:
             "--prune",
             "--filter=blob:none",
             "--tags",
-            _get_official_remote_url(),
+            _get_update_remote_url(),
             f"refs/heads/{normalized_branch}:refs/remotes/origin/{normalized_branch}",
         )
         output = _run_git(repository, "tag", "--merged", f"refs/remotes/origin/{normalized_branch}")
         merged_tags = {line.strip() for line in output.splitlines() if line.strip()}
 
-    _remote_branch_tag_cache[normalized_branch] = (now, merged_tags)
+    _remote_branch_tag_cache[cache_key] = (now, merged_tags)
     return set(merged_tags)
 
 
@@ -426,7 +464,8 @@ def _get_remote_branch_head_info(branch: str) -> dict[str, str]:
     if _is_excluded_self_update_branch(normalized_branch):
         return {"describe": "", "short_tag": "", "commit": "", "released_at": ""}
 
-    cached = _remote_branch_head_cache.get(normalized_branch)
+    cache_key = (_get_update_remote_url(), normalized_branch)
+    cached = _remote_branch_head_cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached[0] <= REMOTE_BRANCH_TAG_CACHE_TTL_SECONDS:
         return dict(cached[1])
@@ -441,7 +480,7 @@ def _get_remote_branch_head_info(branch: str) -> dict[str, str]:
             "--prune",
             "--filter=blob:none",
             "--tags",
-            _get_official_remote_url(),
+            _get_update_remote_url(),
             f"refs/heads/{normalized_branch}:refs/remotes/origin/{normalized_branch}",
         )
         remote_ref = f"refs/remotes/origin/{normalized_branch}"
@@ -456,7 +495,7 @@ def _get_remote_branch_head_info(branch: str) -> dict[str, str]:
         "commit": commit,
         "released_at": released_at,
     }
-    _remote_branch_head_cache[normalized_branch] = (now, payload)
+    _remote_branch_head_cache[cache_key] = (now, payload)
     return dict(payload)
 
 
@@ -509,6 +548,8 @@ def _get_branch_merged_tags(
             return remote_tags
     except Exception:
         pass
+    if is_custom_repository():
+        raise RuntimeError("Cannot resolve tags from the configured update repository.")
     return _get_local_branch_merged_tags(branch, repo_dir=repo_dir)
 
 
@@ -522,6 +563,8 @@ def _get_branch_head_info(
             return remote_info
     except Exception:
         pass
+    if is_custom_repository():
+        raise RuntimeError("Cannot resolve branch head from the configured update repository.")
     return _get_local_branch_head_info(branch, repo_dir=repo_dir)
 
 
@@ -563,7 +606,7 @@ def _format_latest_selector_label(branch: str, describe: str) -> str:
     short_tag, commits_since_tag = _split_describe_version(describe)
     if not short_tag:
         return "latest"
-    if branch.strip().lower() == "main" or commits_since_tag <= 0:
+    if (branch.strip().lower() == "main" and not is_custom_repository()) or commits_since_tag <= 0:
         return f"latest ({short_tag})"
     return f"latest ({short_tag}+{commits_since_tag})"
 
@@ -579,7 +622,7 @@ def _format_branch_head_version(branch: str, describe: str) -> str:
     short_tag, commits_since_tag = _split_describe_version(describe)
     if not short_tag:
         return ""
-    if branch.strip().lower() == "main" or commits_since_tag <= 0:
+    if (branch.strip().lower() == "main" and not is_custom_repository()) or commits_since_tag <= 0:
         return short_tag
     return f"{short_tag}+{commits_since_tag}"
 
@@ -613,6 +656,8 @@ def get_current_major_main_latest_info(
     *,
     repo_dir: str | Path | None = None,
 ) -> dict[str, Any]:
+    if is_custom_repository():
+        return get_current_branch_latest_info("main", repo_dir=repo_dir)
     repository = get_repo_dir(repo_dir)
     available_branches = set(get_available_branch_values(repo_dir=repository))
     if "main" not in available_branches:
@@ -714,15 +759,18 @@ def get_available_tags(
     repo_dir: str | Path | None = None,
     query: str = "",
 ) -> tuple[list[str], str]:
-    result = git.get_remote_releases(OFFICIAL_REPO_AUTHOR, OFFICIAL_REPO_NAME)
-    if result.error:
-        return [], result.error
-    tags = [release.tag for release in result.releases]
-
-    if branch:
-        merged_tags = _get_branch_merged_tags(branch, repo_dir=repo_dir)
-        if merged_tags:
-            tags = [tag for tag in tags if tag in merged_tags]
+    if is_custom_repository():
+        # Forks inherit Git tags, not GitHub release objects.
+        tags = list(_get_remote_branch_merged_tags(branch or "main"))
+    else:
+        result = git.get_remote_releases(OFFICIAL_REPO_AUTHOR, OFFICIAL_REPO_NAME)
+        if result.error:
+            return [], result.error
+        tags = [release.tag for release in result.releases]
+        if branch:
+            merged_tags = _get_branch_merged_tags(branch, repo_dir=repo_dir)
+            if merged_tags:
+                tags = [tag for tag in tags if tag in merged_tags]
 
     tags = _sort_selector_supported_tags(_filter_selector_supported_tags(tags))
 
@@ -771,7 +819,7 @@ def get_selector_tag_options(
 
     normalized_branch = (branch or "").strip().lower()
 
-    if supports_latest and normalized_branch == "main" and same_major_tags:
+    if supports_latest and normalized_branch == "main" and same_major_tags and not is_custom_repository():
         same_major_tags.insert(
             0,
             {
@@ -805,7 +853,9 @@ def get_update_info(repo_dir: str | Path | None = None) -> dict[str, Any]:
     current_branch = version_info.get("branch", "").strip().lower()
     available_branches = get_available_branches(repo_dir=repository)
     available_branch_values = [branch["value"] for branch in available_branches]
-    if current_branch in available_branch_values:
+    if is_custom_repository() and "main" in available_branch_values:
+        default_branch = "main"
+    elif current_branch in available_branch_values:
         default_branch = current_branch
     elif "main" in available_branch_values:
         default_branch = "main"
@@ -826,8 +876,12 @@ def get_update_info(repo_dir: str | Path | None = None) -> dict[str, Any]:
         )
     else:
         major_upgrade_versions = []
+    default_tag = current_version if _is_selector_supported_tag(current_version) else ""
+    if is_custom_repository() and any(option["value"] == "latest" for option in tag_options):
+        default_tag = "latest"
     return {
         "repo_dir": str(repository),
+        "repository": {"url": _get_update_remote_url(), "is_custom": is_custom_repository()},
         "current": version_info,
         "main_branch_latest": get_current_major_main_latest_info(
             current_version,
@@ -855,7 +909,7 @@ def get_update_info(repo_dir: str | Path | None = None) -> dict[str, Any]:
                 os.environ.get("A0_SELF_UPDATE_HEALTH_TIMEOUT_SECONDS", "600")
             ),
             "branch": default_branch,
-            "tag": current_version if _is_selector_supported_tag(current_version) else "",
+            "tag": default_tag,
             "backup_usr": True,
             "backup_path": str(get_default_backup_dir(repository)),
             "backup_name": build_default_backup_name(current_version, current_version),
@@ -876,6 +930,8 @@ def schedule_update(
 ) -> PendingUpdateConfig:
     repository = get_repo_dir(repo_dir)
     version_info = get_repo_version_info(repository)
+    if is_custom_repository() and not durable_self_update_supports_repository(repository):
+        raise RuntimeError("The durable updater needs the fork-aware runtime upgrade before scheduling a fork update.")
 
     normalized_branch = branch.strip().lower()
     available_branch_values = set(get_available_branch_values(repo_dir=repository))
@@ -926,6 +982,7 @@ def schedule_update(
     payload: PendingUpdateConfig = {
         "branch": normalized_branch,  # type: ignore[assignment]
         "tag": normalized_tag,
+        "remote_url": _get_update_remote_url(),
         "source_version": version_info["short_tag"],
         "source_describe": version_info["describe"],
         "source_commit": version_info["commit"],

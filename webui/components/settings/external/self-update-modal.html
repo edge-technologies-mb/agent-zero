@@ -33,6 +33,11 @@
             </a>
           </div>
 
+          <div class="field">
+            <div class="field-label">Update repository</div>
+            <div class="field-description" x-text="$store.selfUpdateStore.repositoryUrl"></div>
+            <div class="field-description" x-show="$store.selfUpdateStore.isCustomRepository">For this fork, latest follows the selected branch head, including patch commits.</div>
+          </div>
           <div class="self-update-tabs">
             <ul class="nav nav-tabs" id="self-update-tabs" role="tablist">
               <li class="nav-item" role="presentation">
@@ -155,7 +160,7 @@
                     class="summary-value"
                     x-text="$store.selfUpdateStore.info?.current_branch_latest?.display_version || 'Unavailable'"
                   ></div>
-                  <template x-if="$store.selfUpdateStore.info?.current_branch_latest?.short_commit && $store.selfUpdateStore.info?.current_branch_latest?.branch !== 'main'">
+                  <template x-if="$store.selfUpdateStore.info?.current_branch_latest?.short_commit && ($store.selfUpdateStore.isCustomRepository || $store.selfUpdateStore.info?.current_branch_latest?.branch !== 'main')">
                     <div class="summary-meta">
                       Commit
                       <code x-text="$store.selfUpdateStore.info?.current_branch_latest?.short_commit"></code>
@@ -173,8 +178,7 @@
                   </template>
                   <template x-if="$store.selfUpdateStore.info?.current_branch_latest?.supported === false">
                     <div class="summary-meta">
-                      Latest official version is only tracked for <code>main</code>, <code>testing</code>,
-                      and <code>development</code>.
+                      This branch is not available in the configured update repository.
                     </div>
                   </template>
                 </div>
@@ -295,7 +299,7 @@
                     <div class="field-label">
                       <div class="field-title">Target branch</div>
                       <div class="field-description">
-                        Choose which official branch context should be used when resolving the requested tag.
+                        Choose which configured repository branch context should be used when resolving the requested tag.
                       </div>
                     </div>
                     <div class="field-control">
@@ -317,11 +321,14 @@
                       <div class="field-title">Version</div>
                       <div class="field-description">
                         Choose a preloaded version target from the
-                        <a href="https://github.com/agent0ai/agent-zero" target="_blank" rel="noreferrer">Agent Zero repository</a>.
+                        <span x-text="$store.selfUpdateStore.repositoryUrl"></span>.
                         Only versions from the current major release line are listed here. Newer major lines require a Docker image update first.
                       </div>
-                      <div class="field-description">
-                        <code>latest</code> resolves to the newest tag on <code>main</code>, and to the current branch head on <code>testing</code> and <code>development</code>.
+                      <div class="field-description" x-show="!$store.selfUpdateStore.isCustomRepository">
+                        <code>latest</code> resolves to the newest tag on <code>main</code>, and to the current branch head on other branches.
+                      </div>
+                      <div class="field-description" x-show="$store.selfUpdateStore.isCustomRepository">
+                        <code>latest</code> installs the selected branch head, including fork patches. An explicit tag installs that tag and may exclude those patches.
                       </div>
                       <template x-if="$store.selfUpdateStore.tagsError">
                         <div class="field-description">

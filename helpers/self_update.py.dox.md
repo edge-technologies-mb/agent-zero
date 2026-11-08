@@ -29,7 +29,7 @@
 - `get_default_backup_dir(repo_dir: str | Path | None=...) -> Path`
 - `get_repo_dir(repo_dir: str | Path | None=...) -> Path`
 - `get_repo_self_update_manager_path(repo_dir: str | Path | None=...) -> Path`
-- `_get_official_remote_url() -> str`
+- `_get_update_remote_url() -> str`
 - `_run_git_raw(*args) -> str`
 - `_run_git(repo_dir: str | Path, *args) -> str`
 - `_normalize_describe_to_version(describe: str) -> str`
@@ -54,6 +54,11 @@
 - Observed side-effect areas: filesystem reads, filesystem writes, subprocess/runtime control, settings/state persistence.
 - `get_update_info().defaults.health_timeout_seconds` exposes `A0_SELF_UPDATE_HEALTH_TIMEOUT_SECONDS` (default 600 seconds) so browser reconnect polling follows the updater's configured health window.
 - Imported dependency areas include: `__future__`, `datetime`, `helpers`, `helpers.localization`, `os`, `pathlib`, `re`, `subprocess`, `tempfile`, `time`, `typing`.
+
+- `A0_SELF_UPDATE_REMOTE_URL` selects a credential-free HTTPS repository for discovery and durable execution; the default remains official upstream. Discovery caches include the repository URL and custom sources never fall back to local origin refs.
+- `get_update_info().repository` exposes URL and `is_custom`; fork defaults are `main/latest` when supported. Fork `latest` follows branch HEAD within the current major line, and fork tags come from Git rather than GitHub releases.
+- `PendingUpdateConfig.remote_url` binds a request to the configured source. The durable updater rejects changed or unbound custom sources before checkout. Fork scheduling requires `durable_self_update_supports_repository()`; startup migration synchronizes old managers.
+- Offline verification: `pytest tests/test_self_update_forks.py tests/test_self_update_tag_filter.py tests/test_self_update_runtime_sync.py` and `node --test tests/test_self_update_forks.mjs`.
 
 ## Key Concepts
 

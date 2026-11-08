@@ -36,6 +36,14 @@ const model = {
   _reconnectTimer: null,
   _tagRequestId: 0,
 
+  get isCustomRepository() {
+    return Boolean(this.info?.repository?.is_custom);
+  },
+
+  get repositoryUrl() {
+    return this.info?.repository?.url || "https://github.com/agent0ai/agent-zero.git";
+  },
+
   get isBusy() {
     return this.loading || this.saving || this.restarting;
   },
@@ -165,6 +173,7 @@ const model = {
 
   get quickUpdateAvailable() {
     return (
+      !this.isCustomRepository &&
       this.isSupported &&
       !this.isBusy &&
       this.mainBranchLatestSupported &&
@@ -174,6 +183,7 @@ const model = {
   },
 
   get quickStatusLabel() {
+    if (this.isCustomRepository) return "CUSTOM REPOSITORY";
     if (this.isCheckingStatus) return "CHECKING";
     if (!this.isSupported) return "UNAVAILABLE";
     if (!this.mainBranchLatestSupported) return "MAIN UNAVAILABLE";
@@ -197,6 +207,7 @@ const model = {
   },
 
   get quickStatusMessage() {
+    if (this.isCustomRepository) return "Updates use the configured fork. Open Advanced and select main / latest to install its branch head.";
     if (this.isCheckingStatus) {
       return "Checking update status...";
     }
@@ -511,7 +522,7 @@ const model = {
       this.applyFormState(
         response.pending || {
           ...(response.defaults || {}),
-          tag: "",
+          tag: this.isCustomRepository ? response.defaults?.tag || "" : "",
         },
       );
       this.applyAvailableTags({
@@ -735,6 +746,10 @@ const model = {
   },
 
   async scheduleQuickUpdate() {
+    if (this.isCustomRepository) {
+      this.error = "Use Advanced for updates from the configured fork.";
+      return;
+    }
     if (!this.mainBranchLatestSupported || !this.mainBranchLatestTag) {
       this.error = "Latest main-branch version is not available right now.";
       return;
